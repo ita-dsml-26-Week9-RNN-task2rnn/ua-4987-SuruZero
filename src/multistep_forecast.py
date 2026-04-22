@@ -82,40 +82,19 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 # ----------------------------
 
 def make_windows(series: np.ndarray, window: int, horizon: int = 1) -> Tuple[np.ndarray, np.ndarray]:
-    """Create supervised windows for forecasting.
-
-    For each start index t, we build:
-        X[t] = series[t : t+window]
-        y[t] = series[t+window : t+window+horizon]
-
-    This supports both:
-    - one-step forecasting: horizon=1, y shape (N, 1)
-    - K-step forecasting: horizon=K, y shape (N, K)
-
-    Parameters
-    ----------
-    series : np.ndarray
-        1D time series of length T. Shape: (T,).
-    window : int
-        Window length w. Must satisfy 1 <= window < T.
-    horizon : int
-        Forecast horizon K (number of future steps per sample). Must satisfy horizon >= 1.
-
-    Returns
-    -------
-    X : np.ndarray
-        Input windows with feature dimension for Keras RNN layers.
-        Shape: (N, window, 1).
-    y : np.ndarray
-        Targets.
-        - If horizon=1: shape (N, 1)
-        - If horizon>1: shape (N, horizon)
-
-    Notes
-    -----
-    The number of samples is N = T - window - horizon + 1.
-    """
-    raise NotImplementedError
+    """Створюємо вікна та багато крокові цілі."""
+    X, y = [], []
+    for i in range(len(series) - window - horizon + 1):
+        X.append(series[i : i + window])
+        y.append(series[i + window : i + window + horizon])
+    
+    X = np.array(X).reshape(-1, window, 1)
+    y = np.array(y)
+    
+    if horizon == 1:
+        y = y.reshape(-1, 1)
+        
+    return X, y
 
 
 def time_split(
@@ -124,29 +103,75 @@ def time_split(
     train_frac: float = 0.70,
     val_frac: float = 0.15,
 ) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
-    """Time-based split (NO shuffle) to avoid leakage.
+    """Спліт за часом без перемішування."""
+    n = len(X)
+    train_end = int(n * train_frac)
+    val_end = int(n * (train_frac + val_frac))
 
-    Parameters
-    ----------
-    X : np.ndarray
-        Windowed inputs, shape (N, window, 1).
-    y : np.ndarray
-        Targets, shape (N, 1) for horizon=1 or (N, K) for horizon=K.
-    train_frac : float
-        Train fraction.
-    val_frac : float
-        Validation fraction.
+    if train_end == 0 or val_end <= train_end or val_end >= n:
+        if n < 3: raise ValueError("Not enough data to split.")
 
-    Returns
-    -------
-    (X_train, y_train), (X_val, y_val), (X_test, y_test)
+    return (X[:train_end], y[:train_end]), \
+           (X[train_end:val_end], y[train_end:val_end]), \
+           (X[val_end:], y[val_end:])
 
-    Raises
-    ------
-    ValueError
-        If fractions are invalid or produce empty splits.
-    """
-    raise NotImplementedError
+
+def build_model(
+    window: int,
+    output_dim: int,
+    n_units: int = 64,
+    dense_units: int = 32,
+    dropout: float = 0.2,
+    learning_rate: float = 1e-3,
+) -> tf.keras.Model:
+    """LSTM модель, що підтримує вихідний вектор розміром output_dim."""
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(window, 1)),
+        tf.keras.layers.LSTM(n_units),
+        tf.keras.layers.Dropout(dropout),
+        tf.keras.layers.Dense(dense_units, activation="relu"),
+        tf.keras.layers.Dense(output_dim) 
+    ])
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="mse",
+        metrics=["mae"]
+    )
+    return model
+
+
+def train_model(
+    series: np.ndarray,
+    window: int,
+    horizon: int,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
+    epochs: int = 25,
+    batch_size: int = 64,
+    seed: int = 42,
+    verbose: int = 0,
+) -> Tuple[tf.keras.Model, np.ndarray, np.ndarray]:
+    """Пайплан навчання для заданого горизонту."""
+    tf.keras.utils.set_random_seed(seed)
+    
+    X, y = make_windows(series, window, horizon)
+    (X_tr, y_tr), (X_val, y_val), (X_te, y_te) = time_split(X, y, train_frac, val_frac)
+    
+    model = build_model(window, output_dim=horizon)
+    
+    stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    
+    model.fit(
+        X_tr, y_tr,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=verbose,
+        callbacks=[stop]
+    )
+    
+    return model, X_te, y_te
 
 
 # ----------------------------
@@ -161,36 +186,21 @@ def build_model(
     dropout: float = 0.2,
     learning_rate: float = 1e-3,
 ) -> tf.keras.Model:
-    """Build and compile an LSTM model.
+    """Будуємо LSTM модель для вектора виходу розміром output_dim."""
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(window, 1)),
+        tf.keras.layers.LSTM(n_units),
+        tf.keras.layers.Dropout(dropout),
+        tf.keras.layers.Dense(dense_units, activation="relu"),
+        tf.keras.layers.Dense(output_dim)
+    ])
 
-    Parameters
-    ----------
-    window : int
-        Input window length. Input shape will be (window, 1).
-    output_dim : int
-        Number of outputs.
-        - output_dim=1 for one-step model
-        - output_dim=K for K-step model
-    n_units : int
-        LSTM units.
-    dense_units : int
-        Dense hidden units.
-    dropout : float
-        Dropout after LSTM.
-    learning_rate : float
-        Adam learning rate.
-
-    Returns
-    -------
-    tf.keras.Model
-        Compiled model with output shape (None, output_dim).
-
-    Notes
-    -----
-    - For output_dim>1, use a Dense(output_dim) output layer (vector prediction).
-    - Keep loss as MSE, metric MAE.
-    """
-    raise NotImplementedError
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="mse",
+        metrics=["mae"]
+    )
+    return model
 
 
 def train_model(
@@ -204,46 +214,31 @@ def train_model(
     seed: int = 42,
     verbose: int = 0,
 ) -> Tuple[tf.keras.Model, np.ndarray, np.ndarray]:
-    """Train a model for the given horizon and return model + test split.
-
-    Parameters
-    ----------
-    series : np.ndarray
-        1D time series, shape (T,).
-    window : int
-        Window length.
-    horizon : int
-        Forecast horizon per sample.
-        - 1 for one-step model
-        - K (e.g., 20) for K-step model
-    train_frac : float
-        Train fraction.
-    val_frac : float
-        Validation fraction.
-    epochs : int
-        Training epochs.
-    batch_size : int
-        Batch size.
-    seed : int
-        Random seed.
-    verbose : int
-        Verbosity for training.
-
-    Returns
-    -------
-    model : tf.keras.Model
-        Trained model.
-    X_test : np.ndarray
-        Test windows, shape (N_test, window, 1).
-    y_test : np.ndarray
-        Test targets, shape (N_test, 1) or (N_test, K).
-
-    Notes
-    -----
-    - Use EarlyStopping (recommended) to reduce overfitting.
-    - Do not shuffle time.
-    """
-    raise NotImplementedError
+    """Пайплайн навчання вікна в спліт в модель в fit."""
+    tf.keras.utils.set_random_seed(seed)
+    
+    X, y = make_windows(series, window, horizon)
+    
+    (X_tr, y_tr), (X_val, y_val), (X_te, y_te) = time_split(X, y, train_frac, val_frac)
+    
+    model = build_model(window, output_dim=horizon)
+    
+    stop_callback = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss', 
+        patience=5, 
+        restore_best_weights=True
+    )
+    
+    model.fit(
+        X_tr, y_tr,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=verbose,
+        callbacks=[stop_callback]
+    )
+    
+    return model, X_te, y_te
 
 
 # ----------------------------
@@ -255,30 +250,18 @@ def recursive_rollout_one_step(
     init_window: np.ndarray,
     horizon: int = 100,
 ) -> np.ndarray:
-    """Recursive rollout for a one-step model (stride=1).
+    """Стратегія 1: Прогнозуємо по 1 кроку, додаємо в кінець, зсуваємо."""
+    current_window = init_window.copy()
+    forecast = []
+    window_size = len(init_window)
 
-    Parameters
-    ----------
-    model : tf.keras.Model
-        One-step model that maps (1, window, 1) -> (1, 1).
-    init_window : np.ndarray
-        Initial context window (seed). Shape: (window,).
-    horizon : int
-        Number of future steps to generate.
-
-    Returns
-    -------
-    np.ndarray
-        Forecast of length `horizon`. Shape: (horizon,).
-
-    Notes
-    -----
-    At each step we:
-    1) predict next value
-    2) append it to the window
-    3) shift window by 1
-    """
-    raise NotImplementedError
+    for _ in range(horizon):
+        pred = model.predict(current_window.reshape(1, window_size, 1), verbose=0)
+        val = pred[0, 0]
+        forecast.append(val)
+        current_window = np.append(current_window[1:], val)
+        
+    return np.array(forecast)
 
 
 def recursive_rollout_k_step_stride_k(
@@ -287,34 +270,19 @@ def recursive_rollout_k_step_stride_k(
     k: int = 20,
     horizon: int = 100,
 ) -> np.ndarray:
-    """Recursive rollout for a K-step model using stride=K.
+    """Стратегія 2: Прогнозуємо блоками по K значень."""
+    current_window = init_window.copy()
+    forecast = []
+    window_size = len(init_window)
 
-    Parameters
-    ----------
-    model : tf.keras.Model
-        K-step model that maps (1, window, 1) -> (1, K).
-    init_window : np.ndarray
-        Initial context window. Shape: (window,).
-    k : int
-        Steps predicted per model call.
-    horizon : int
-        Total steps to generate. Assumed divisible by k (e.g., 100 with k=20).
-
-    Returns
-    -------
-    np.ndarray
-        Forecast of length `horizon`. Shape: (horizon,).
-
-    Notes
-    -----
-    We repeatedly:
-    1) predict a block of K future values
-    2) append the full block
-    3) shift window by K
-
-    This reduces recursion depth (H/K calls).
-    """
-    raise NotImplementedError
+    for _ in range(0, horizon, k):
+        pred_block = model.predict(current_window.reshape(1, window_size, 1), verbose=0)
+        block = pred_block[0] # Отримуємо вектор довжиною k
+        forecast.extend(block)
+        # Зсуваємо вікно одразу на k елементів
+        current_window = np.append(current_window[k:], block)
+        
+    return np.array(forecast)[:horizon]
 
 
 def recursive_rollout_k_step_stride_1(
@@ -323,35 +291,18 @@ def recursive_rollout_k_step_stride_1(
     k: int = 20,
     horizon: int = 100,
 ) -> np.ndarray:
-    """Recursive rollout for a K-step model using stride=1.
+    """Стратегія 3: Прогнозуємо блоком K, але беремо лише перше значення."""
+    current_window = init_window.copy()
+    forecast = []
+    window_size = len(init_window)
 
-    Parameters
-    ----------
-    model : tf.keras.Model
-        K-step model that maps (1, window, 1) -> (1, K).
-    init_window : np.ndarray
-        Initial context window. Shape: (window,).
-    k : int
-        Steps predicted per model call.
-    horizon : int
-        Total steps to generate.
-
-    Returns
-    -------
-    np.ndarray
-        Forecast of length `horizon`. Shape: (horizon,).
-
-    Notes
-    -----
-    At each step we:
-    1) predict K future values
-    2) take ONLY the first predicted value (t+1)
-    3) append it
-    4) shift window by 1
-
-    This uses the K-step model as a one-step generator.
-    """
-    raise NotImplementedError
+    for _ in range(horizon):
+        pred_block = model.predict(current_window.reshape(1, window_size, 1), verbose=0)
+        val = pred_block[0, 0]
+        forecast.append(val)
+        current_window = np.append(current_window[1:], val)
+        
+    return np.array(forecast)
 
 
 # ----------------------------
